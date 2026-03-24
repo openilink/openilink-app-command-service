@@ -471,9 +471,7 @@ func resolveReply(result *CommandResult) Reply {
 			return Reply{MsgType: "image", MediaURL: content}
 		}
 		if strings.HasPrefix(content, "data:image/") {
-			if idx := strings.Index(content, ","); idx >= 0 {
-				return Reply{MsgType: "image", MediaBase64: content[idx+1:]}
-			}
+			return Reply{MsgType: "image", MediaBase64: content}
 		}
 		return Reply{Text: "命令返回了图片内容，但格式无法识别，御坂如实地报告道。"}
 	default:
