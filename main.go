@@ -28,6 +28,7 @@ type Config struct {
 	BaseURL             string
 	CommandAPIBaseURL   string
 	CommandAPITimeoutMS int
+	SyncDeadlineMS      int
 }
 
 type Installation struct {
@@ -78,7 +79,8 @@ func main() {
 		DatabaseURL:         os.Getenv("DATABASE_URL"),
 		BaseURL:             strings.TrimRight(os.Getenv("BASE_URL"), "/"),
 		CommandAPIBaseURL:   strings.TrimRight(envOr("COMMAND_API_BASE_URL", "https://bhwa233-api.vercel.app/api"), "/"),
-		CommandAPITimeoutMS: envIntOr("COMMAND_API_TIMEOUT_MS", 2500),
+		CommandAPITimeoutMS: envIntOr("COMMAND_API_TIMEOUT_MS", 10000),
+		SyncDeadlineMS:      envIntOr("SYNC_DEADLINE_MS", 2000),
 	}
 
 	httpClient = &http.Client{Timeout: time.Duration(cfg.CommandAPITimeoutMS) * time.Millisecond}
@@ -278,7 +280,7 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 	slog.Info("received event", "type", event.Type, "event_type", event.Event.Type, "installation", inst.ID, "trace_id", event.TraceID)
 
 	if event.Event.Type == "command" {
-		handleCommand(w, event)
+		handleCommand(w, event, inst)
 		return
 	}
 
@@ -286,7 +288,7 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
-func handleCommand(w http.ResponseWriter, event HubEvent) {
+func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 	data := event.Event.Data
 	commandName, _ := data["command"].(string)
 	text, _ := data["text"].(string)
@@ -312,14 +314,81 @@ func handleCommand(w http.ResponseWriter, event HubEvent) {
 		fullCommand += " " + text
 	}
 
-	result, err := executeCommandServiceCommand(rctx(), fullCommand)
-	if err != nil {
-		slog.Error("command service command failed", "command", fullCommand, "err", err, "trace_id", event.TraceID)
-		jsonReply(w, fmt.Sprintf("命令服务执行失败: %v", err))
+	// Try sync first; if upstream is slow, reply immediately and finish async.
+	syncDeadline := time.Duration(cfg.SyncDeadlineMS) * time.Millisecond
+	ctx, cancel := context.WithTimeout(rctx(), syncDeadline)
+	defer cancel()
+
+	result, err := executeCommandServiceCommand(ctx, fullCommand)
+	if ctx.Err() == nil {
+		// Finished within sync deadline.
+		if err != nil {
+			slog.Error("command failed", "command", fullCommand, "err", err, "trace_id", event.TraceID)
+			jsonReply(w, fmt.Sprintf("命令服务执行失败: %v", err))
+			return
+		}
+		jsonReply(w, renderReply(result))
 		return
 	}
 
-	jsonReply(w, renderReply(result))
+	// Sync deadline exceeded — ack now, finish in background.
+	slog.Info("command going async", "command", fullCommand, "trace_id", event.TraceID)
+	jsonReply(w, fmt.Sprintf("/%s 处理中，稍后推送结果…", commandKey))
+
+	replyTo := resolveReplyTo(data)
+	go func() {
+		asyncResult, asyncErr := executeCommandServiceCommand(rctx(), fullCommand)
+		var msg string
+		if asyncErr != nil {
+			slog.Error("async command failed", "command", fullCommand, "err", asyncErr, "trace_id", event.TraceID)
+			msg = fmt.Sprintf("命令服务执行失败: %v", asyncErr)
+		} else {
+			msg = renderReply(asyncResult)
+		}
+		if err := sendBotMessage(inst.AppToken, replyTo, msg, event.TraceID); err != nil {
+			slog.Error("bot send failed", "to", replyTo, "err", err, "trace_id", event.TraceID)
+		}
+	}()
+}
+
+func resolveReplyTo(data map[string]any) string {
+	if g, ok := data["group"].(map[string]any); ok {
+		if id, ok := g["id"].(string); ok && id != "" {
+			return id
+		}
+	}
+	if s, ok := data["sender"].(map[string]any); ok {
+		if id, ok := s["id"].(string); ok && id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+func sendBotMessage(appToken, to, content, traceID string) error {
+	payload, _ := json.Marshal(map[string]string{
+		"to":       to,
+		"content":  content,
+		"trace_id": traceID,
+	})
+	req, err := http.NewRequestWithContext(rctx(), http.MethodPost, cfg.HubURL+"/bot/v1/messages/send", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+appToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("bot api %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 func executeCommandServiceCommand(ctx context.Context, command string) (*CommandResult, error) {

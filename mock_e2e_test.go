@@ -71,7 +71,7 @@ func TestMockManifestDirectCommands(t *testing.T) {
 	ts := setupMockCommandAPI(t)
 	defer ts.Close()
 
-	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000}
+	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000, SyncDeadlineMS: 2000}
 	httpClient = &http.Client{Timeout: 2 * time.Second}
 
 	req := httptest.NewRequest(http.MethodGet, "/manifest.json", nil)
@@ -110,7 +110,7 @@ func TestMockHubWebhookGoldCommand(t *testing.T) {
 	mock, cleanup := setupMockDB(t)
 	defer cleanup()
 
-	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000}
+	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000, SyncDeadlineMS: 2000}
 	httpClient = &http.Client{Timeout: 2 * time.Second}
 
 	rows := sqlmock.NewRows([]string{"id", "app_token", "signing_secret", "bot_id", "handle"}).
@@ -153,7 +153,7 @@ func TestMockHubWebhookCommandWithArgs(t *testing.T) {
 	mock, cleanup := setupMockDB(t)
 	defer cleanup()
 
-	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000}
+	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000, SyncDeadlineMS: 2000}
 	httpClient = &http.Client{Timeout: 2 * time.Second}
 
 	rows := sqlmock.NewRows([]string{"id", "app_token", "signing_secret", "bot_id", "handle"}).
@@ -196,7 +196,7 @@ func TestMockHubWebhookCommandWithStructuredArgs(t *testing.T) {
 	mock, cleanup := setupMockDB(t)
 	defer cleanup()
 
-	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000}
+	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000, SyncDeadlineMS: 2000}
 	httpClient = &http.Client{Timeout: 2 * time.Second}
 
 	rows := sqlmock.NewRows([]string{"id", "app_token", "signing_secret", "bot_id", "handle"}).
@@ -242,7 +242,7 @@ func TestMockImageResultFallsBackToTextNotice(t *testing.T) {
 	ts := setupMockCommandAPI(t)
 	defer ts.Close()
 
-	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000}
+	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000, SyncDeadlineMS: 2000}
 	httpClient = &http.Client{Timeout: 2 * time.Second}
 
 	result, err := executeCommandServiceCommand(rctx(), "img")
