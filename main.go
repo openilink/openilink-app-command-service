@@ -60,6 +60,14 @@ type CommandResult struct {
 	Type    string `json:"type"`
 }
 
+// Reply represents a resolved reply ready for sync or async delivery.
+type Reply struct {
+	Text        string // text content or fallback
+	MsgType     string // "text" or "image"
+	MediaURL    string // non-empty for image URL replies
+	MediaBase64 string // non-empty for base64 image replies
+}
+
 type CommandDefinition struct {
 	Key         string `json:"key"`
 	Description string `json:"description"`
@@ -295,7 +303,7 @@ func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 
 	commandKey := strings.TrimSpace(strings.TrimPrefix(commandName, "/"))
 	if commandKey == "" {
-		jsonReply(w, "命令不能为空")
+		writeSyncReply(w, Reply{Text: "命令不能为空"})
 		return
 	}
 
@@ -324,28 +332,28 @@ func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 		// Finished within sync deadline.
 		if err != nil {
 			slog.Error("command failed", "command", fullCommand, "err", err, "trace_id", event.TraceID)
-			jsonReply(w, fmt.Sprintf("命令服务执行失败: %v", err))
+			writeSyncReply(w, Reply{Text: fmt.Sprintf("命令服务执行失败: %v", err)})
 			return
 		}
-		jsonReply(w, renderReply(result))
+		writeSyncReply(w, resolveReply(result))
 		return
 	}
 
 	// Sync deadline exceeded — ack now, finish in background.
 	slog.Info("command going async", "command", fullCommand, "trace_id", event.TraceID)
-	jsonReply(w, fmt.Sprintf("/%s 处理中，稍后推送结果…", commandKey))
+	writeSyncReply(w, Reply{Text: fmt.Sprintf("/%s 处理中，稍后推送结果…", commandKey)})
 
 	replyTo := resolveReplyTo(data)
 	go func() {
 		asyncResult, asyncErr := executeCommandServiceCommand(rctx(), fullCommand)
-		var msg string
+		var reply Reply
 		if asyncErr != nil {
 			slog.Error("async command failed", "command", fullCommand, "err", asyncErr, "trace_id", event.TraceID)
-			msg = fmt.Sprintf("命令服务执行失败: %v", asyncErr)
+			reply = Reply{Text: fmt.Sprintf("命令服务执行失败: %v", asyncErr)}
 		} else {
-			msg = renderReply(asyncResult)
+			reply = resolveReply(asyncResult)
 		}
-		if err := sendBotMessage(inst.AppToken, replyTo, msg, event.TraceID); err != nil {
+		if err := sendBotMessage(inst.AppToken, replyTo, reply, event.TraceID); err != nil {
 			slog.Error("bot send failed", "to", replyTo, "err", err, "trace_id", event.TraceID)
 		}
 	}()
@@ -365,12 +373,26 @@ func resolveReplyTo(data map[string]any) string {
 	return ""
 }
 
-func sendBotMessage(appToken, to, content, traceID string) error {
-	payload, _ := json.Marshal(map[string]string{
+func sendBotMessage(appToken, to string, reply Reply, traceID string) error {
+	msg := map[string]string{
 		"to":       to,
-		"content":  content,
 		"trace_id": traceID,
-	})
+	}
+	if reply.MediaURL != "" {
+		msg["type"] = reply.MsgType
+		msg["url"] = reply.MediaURL
+		if reply.Text != "" {
+			msg["content"] = reply.Text
+		}
+	} else if reply.MediaBase64 != "" {
+		msg["type"] = reply.MsgType
+		msg["base64"] = reply.MediaBase64
+	} else {
+		msg["type"] = "text"
+		msg["content"] = reply.Text
+	}
+
+	payload, _ := json.Marshal(msg)
 	req, err := http.NewRequestWithContext(rctx(), http.MethodPost, cfg.HubURL+"/bot/v1/messages/send", bytes.NewReader(payload))
 	if err != nil {
 		return err
@@ -418,32 +440,45 @@ func executeCommandServiceCommand(ctx context.Context, command string) (*Command
 	return &result, nil
 }
 
-func renderReply(result *CommandResult) string {
+func resolveReply(result *CommandResult) Reply {
 	if result == nil {
-		return "命令服务返回为空"
+		return Reply{Text: "命令服务返回为空"}
 	}
 	content := strings.TrimSpace(result.Content)
 	if content == "" {
-		return "命令服务返回为空"
+		return Reply{Text: "命令服务返回为空"}
 	}
 
 	switch result.Type {
 	case "image":
 		if strings.HasPrefix(content, "http://") || strings.HasPrefix(content, "https://") {
-			return content
+			return Reply{MsgType: "image", MediaURL: content}
 		}
 		if strings.HasPrefix(content, "data:image/") {
-			return "命令返回了一张图片，但当前 App 同步回复只稳定支持文本，御坂如实地报告道。"
+			if idx := strings.Index(content, ","); idx >= 0 {
+				return Reply{MsgType: "image", MediaBase64: content[idx+1:]}
+			}
 		}
-		return "命令返回了图片内容，但当前 App 版本暂不直接回传该图片格式，御坂如实地报告道。"
+		return Reply{Text: "命令返回了图片内容，但格式无法识别，御坂如实地报告道。"}
 	default:
-		return content
+		return Reply{Text: content}
 	}
 }
 
-func jsonReply(w http.ResponseWriter, text string) {
+func writeSyncReply(w http.ResponseWriter, reply Reply) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"reply": text})
+	resp := map[string]string{}
+	if reply.MediaURL != "" {
+		resp["reply_type"] = reply.MsgType
+		resp["reply_url"] = reply.MediaURL
+	} else if reply.MediaBase64 != "" {
+		resp["reply_type"] = reply.MsgType
+		resp["reply_base64"] = reply.MediaBase64
+	}
+	if reply.Text != "" {
+		resp["reply"] = reply.Text
+	}
+	json.NewEncoder(w).Encode(resp)
 }
 
 func getInstallation(id string) *Installation {

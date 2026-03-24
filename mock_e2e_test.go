@@ -249,8 +249,8 @@ func TestMockImageResultFallsBackToTextNotice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute img: %v", err)
 	}
-	text := renderReply(result)
-	if !strings.Contains(text, "图片") {
-		t.Fatalf("expected image fallback notice, got %q", text)
+	reply := resolveReply(result)
+	if reply.MsgType != "image" || reply.MediaBase64 == "" {
+		t.Fatalf("expected base64 image reply, got type=%q base64=%q text=%q", reply.MsgType, reply.MediaBase64, reply.Text)
 	}
 }
