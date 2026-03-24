@@ -12,7 +12,7 @@ services:
       COMMAND_API_TIMEOUT_MS: "2500"
     labels:
       - traefik.enable=true
-      - "traefik.http.routers.command-service-app.rule=Host(`command-service.app.openilink.com`)"
+      - "traefik.http.routers.command-service-app.rule=Host(`command-service-app.openilink.com`)"
       - traefik.http.routers.command-service-app.entrypoints=websecure
       - traefik.http.routers.command-service-app.tls.certresolver=letsencrypt
       - traefik.http.services.command-service-app.loadbalancer.server.port=8081

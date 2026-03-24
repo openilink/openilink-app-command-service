@@ -87,20 +87,20 @@ func TestMockManifestDirectCommands(t *testing.T) {
 		t.Fatalf("manifest decode: %v", err)
 	}
 
-	commands := body["commands"].([]any)
+	tools := body["tools"].([]any)
 	seenGold := false
 	seenA := false
-	for _, item := range commands {
+	for _, item := range tools {
 		m := item.(map[string]any)
-		if m["name"] == "/gold" {
+		if m["name"] == "gold" && m["command"] == "gold" {
 			seenGold = true
 		}
-		if m["name"] == "/a" && strings.Contains(m["usage"].(string), "<args>") {
+		if m["name"] == "a" && m["command"] == "a" && m["parameters"] != nil {
 			seenA = true
 		}
 	}
 	if !seenGold || !seenA {
-		t.Fatalf("expected direct command registration, got %s", w.Body.String())
+		t.Fatalf("expected tool registration, got %s", w.Body.String())
 	}
 }
 
@@ -119,9 +119,9 @@ func TestMockHubWebhookGoldCommand(t *testing.T) {
 		WithArgs("inst_1").
 		WillReturnRows(rows)
 
-	envelope := HubEvent{V: 1, Type: "command", TraceID: "tr_test", InstallationID: "inst_1"}
+	envelope := HubEvent{V: 1, Type: "event", TraceID: "tr_test", InstallationID: "inst_1"}
 	envelope.Event.Type = "command"
-	envelope.Event.Data = map[string]any{"command": "/gold", "text": ""}
+	envelope.Event.Data = map[string]any{"command": "gold", "text": "", "args": nil}
 	body, _ := json.Marshal(envelope)
 	tsValue := "1710000000"
 
@@ -162,11 +162,59 @@ func TestMockHubWebhookCommandWithArgs(t *testing.T) {
 		WithArgs("inst_1").
 		WillReturnRows(rows)
 
-	envelope := HubEvent{V: 1, Type: "command", TraceID: "tr_test_2", InstallationID: "inst_1"}
+	envelope := HubEvent{V: 1, Type: "event", TraceID: "tr_test_2", InstallationID: "inst_1"}
 	envelope.Event.Type = "command"
-	envelope.Event.Data = map[string]any{"command": "/a", "text": "你好"}
+	envelope.Event.Data = map[string]any{"command": "a", "text": "你好", "args": nil}
 	body, _ := json.Marshal(envelope)
 	tsValue := "1710000001"
+
+	req := httptest.NewRequest(http.MethodPost, "/hub/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-Timestamp", tsValue)
+	req.Header.Set("X-Signature", signBody("secret123", tsValue, body))
+	w := httptest.NewRecorder()
+
+	handleHubWebhook(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["reply"] != "鸡哥说：你好" {
+		t.Fatalf("reply=%q", resp["reply"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestMockHubWebhookCommandWithStructuredArgs(t *testing.T) {
+	ts := setupMockCommandAPI(t)
+	defer ts.Close()
+	mock, cleanup := setupMockDB(t)
+	defer cleanup()
+
+	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000}
+	httpClient = &http.Client{Timeout: 2 * time.Second}
+
+	rows := sqlmock.NewRows([]string{"id", "app_token", "signing_secret", "bot_id", "handle"}).
+		AddRow("inst_1", "app_xxx", "secret123", "bot_1", "")
+	mock.ExpectQuery("SELECT id, app_token, signing_secret, bot_id, handle FROM installations WHERE id=\\$1").
+		WithArgs("inst_1").
+		WillReturnRows(rows)
+
+	// AI Agent triggers with structured args
+	envelope := HubEvent{V: 1, Type: "event", TraceID: "tr_test_3", InstallationID: "inst_1"}
+	envelope.Event.Type = "command"
+	envelope.Event.Data = map[string]any{
+		"command": "a",
+		"text":    "",
+		"args":    map[string]any{"text": "你好"},
+	}
+	body, _ := json.Marshal(envelope)
+	tsValue := "1710000002"
 
 	req := httptest.NewRequest(http.MethodPost, "/hub/webhook", strings.NewReader(string(body)))
 	req.Header.Set("X-Timestamp", tsValue)

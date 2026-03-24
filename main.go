@@ -158,19 +158,19 @@ func handleManifest(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"slug":        "command-service",
-		"name":        "Command Service",
-		"description": "Expose upstream command-service commands directly, currently backed by bhwa233-api",
-		"icon":        "🛰️",
-		"commands":    buildManifestCommands(defs),
-		"events":      []string{},
-		"scopes":      []string{},
+		"slug":         "command-service",
+		"name":         "Command Service",
+		"description":  "Expose upstream command-service commands directly, currently backed by bhwa233-api",
+		"icon":         "🛰️",
+		"tools":        buildManifestTools(defs),
+		"events":       []string{},
+		"scopes":       []string{},
 		"redirect_url": cfg.BaseURL + "/callback",
 	})
 }
 
-func buildManifestCommands(defs []CommandDefinition) []map[string]string {
-	commands := make([]map[string]string, 0, len(defs))
+func buildManifestTools(defs []CommandDefinition) []map[string]any {
+	tools := make([]map[string]any, 0, len(defs))
 	seen := map[string]bool{}
 
 	for _, def := range defs {
@@ -180,27 +180,37 @@ func buildManifestCommands(defs []CommandDefinition) []map[string]string {
 		}
 		seen[key] = true
 
-		usage := "/" + key
-		if strings.HasSuffix(def.Key, " ") {
-			usage += " <args>"
-		}
-
 		desc := strings.TrimSpace(def.Description)
 		if desc == "" {
 			desc = "Run command: " + key
 		}
 
-		commands = append(commands, map[string]string{
-			"name":        "/" + key,
+		tool := map[string]any{
+			"name":        key,
 			"description": desc,
-			"usage":       usage,
-		})
+			"command":     key,
+		}
+
+		if strings.HasSuffix(def.Key, " ") {
+			tool["parameters"] = map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"text": map[string]any{
+						"type":        "string",
+						"description": "Command arguments",
+					},
+				},
+				"required": []string{"text"},
+			}
+		}
+
+		tools = append(tools, tool)
 	}
 
-	sort.Slice(commands, func(i, j int) bool {
-		return commands[i]["name"] < commands[j]["name"]
+	sort.Slice(tools, func(i, j int) bool {
+		return tools[i]["name"].(string) < tools[j]["name"].(string)
 	})
-	return commands
+	return tools
 }
 
 func fetchCommandDefinitions(ctx context.Context) ([]CommandDefinition, error) {
@@ -267,7 +277,7 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("received event", "type", event.Type, "event_type", event.Event.Type, "installation", inst.ID, "trace_id", event.TraceID)
 
-	if event.Type == "command" {
+	if event.Event.Type == "command" {
 		handleCommand(w, event)
 		return
 	}
@@ -285,6 +295,15 @@ func handleCommand(w http.ResponseWriter, event HubEvent) {
 	if commandKey == "" {
 		jsonReply(w, "命令不能为空")
 		return
+	}
+
+	// Prefer structured args from AI Agent, fall back to free-form text from user.
+	if argsRaw, ok := data["args"]; ok && argsRaw != nil {
+		if argsMap, ok := argsRaw.(map[string]any); ok {
+			if t, ok := argsMap["text"].(string); ok && t != "" {
+				text = t
+			}
+		}
 	}
 
 	text = strings.TrimSpace(text)
