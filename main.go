@@ -1,0 +1,320 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	_ "github.com/lib/pq"
+)
+
+type Config struct {
+	Port                string
+	HubURL              string
+	DatabaseURL         string
+	BaseURL             string
+	CommandAPIBaseURL   string
+	CommandAPITimeoutMS int
+}
+
+type Installation struct {
+	ID            string
+	AppToken      string
+	SigningSecret string
+	BotID         string
+	Handle        string
+}
+
+type HubEvent struct {
+	V              int    `json:"v"`
+	Type           string `json:"type"`
+	TraceID        string `json:"trace_id"`
+	InstallationID string `json:"installation_id"`
+	Bot            struct {
+		ID string `json:"id"`
+	} `json:"bot"`
+	Event struct {
+		Type      string         `json:"type"`
+		ID        string         `json:"id"`
+		Timestamp int64          `json:"timestamp"`
+		Data      map[string]any `json:"data"`
+	} `json:"event"`
+}
+
+type CommandResult struct {
+	Content string `json:"content"`
+	Type    string `json:"type"`
+}
+
+var (
+	cfg        Config
+	db         *sql.DB
+	httpClient *http.Client
+)
+
+func main() {
+	cfg = Config{
+		Port:                envOr("PORT", "8081"),
+		HubURL:              strings.TrimRight(envOr("HUB_URL", "https://hub.openilink.com"), "/"),
+		DatabaseURL:         os.Getenv("DATABASE_URL"),
+		BaseURL:             strings.TrimRight(os.Getenv("BASE_URL"), "/"),
+		CommandAPIBaseURL:   strings.TrimRight(envOr("COMMAND_API_BASE_URL", "https://bhwa233-api.vercel.app/api"), "/"),
+		CommandAPITimeoutMS: envIntOr("COMMAND_API_TIMEOUT_MS", 2500),
+	}
+
+	httpClient = &http.Client{Timeout: time.Duration(cfg.CommandAPITimeoutMS) * time.Millisecond}
+
+	var err error
+	db, err = sql.Open("postgres", cfg.DatabaseURL)
+	if err != nil {
+		slog.Error("db open failed", "err", err)
+		os.Exit(1)
+	}
+	if err := migrate(); err != nil {
+		slog.Error("db migrate failed", "err", err)
+		os.Exit(1)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /hub/webhook", handleHubWebhook)
+	mux.HandleFunc("POST /callback", handleCallback)
+	mux.HandleFunc("GET /manifest.json", handleManifest)
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	addr := ":" + cfg.Port
+	slog.Info("command service bridge app starting", "addr", addr, "hub", cfg.HubURL, "command_api", cfg.CommandAPIBaseURL)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		slog.Error("server failed", "err", err)
+		os.Exit(1)
+	}
+}
+
+func migrate() error {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS installations (
+		id TEXT PRIMARY KEY,
+		app_token TEXT NOT NULL,
+		signing_secret TEXT NOT NULL,
+		bot_id TEXT NOT NULL,
+		handle TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	return err
+}
+
+func handleCallback(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		InstallationID string `json:"installation_id"`
+		AppToken       string `json:"app_token"`
+		SigningSecret  string `json:"signing_secret"`
+		BotID          string `json:"bot_id"`
+		Handle         string `json:"handle"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	_, err := db.Exec(`INSERT INTO installations (id, app_token, signing_secret, bot_id, handle)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (id) DO UPDATE SET app_token=$2, signing_secret=$3, bot_id=$4, handle=$5`,
+		req.InstallationID, req.AppToken, req.SigningSecret, req.BotID, req.Handle)
+	if err != nil {
+		slog.Error("save installation failed", "err", err)
+		http.Error(w, "save failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"request_url": cfg.BaseURL + "/hub/webhook"})
+}
+
+func handleManifest(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"slug":        "command-service-bridge",
+		"name":        "Command Service Bridge",
+		"description": "Bridge to an HTTP command service, currently backed by bhwa233-api",
+		"icon":        "🛰️",
+		"commands": []map[string]string{
+			{"name": "/command-service", "description": "Run a command service command", "usage": "/command-service hp"},
+		},
+		"events":       []string{},
+		"scopes":       []string{},
+		"redirect_url": cfg.BaseURL + "/callback",
+	})
+}
+
+func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+
+	var event HubEvent
+	if err := json.Unmarshal(body, &event); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	if event.Type == "url_verification" {
+		var challenge struct {
+			Challenge string `json:"challenge"`
+		}
+		_ = json.Unmarshal(body, &challenge)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"challenge": challenge.Challenge})
+		return
+	}
+
+	inst := getInstallation(event.InstallationID)
+	if inst == nil {
+		http.Error(w, "unknown installation", http.StatusUnauthorized)
+		return
+	}
+
+	timestamp := r.Header.Get("X-Timestamp")
+	signature := r.Header.Get("X-Signature")
+	expected := computeSignature(inst.SigningSecret, timestamp, body)
+	if signature != "sha256="+expected {
+		http.Error(w, "invalid signature", http.StatusUnauthorized)
+		return
+	}
+
+	slog.Info("received event", "type", event.Type, "event_type", event.Event.Type, "installation", inst.ID, "trace_id", event.TraceID)
+
+	if event.Type == "command" {
+		handleCommand(w, event)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+}
+
+func handleCommand(w http.ResponseWriter, event HubEvent) {
+	data := event.Event.Data
+	commandName, _ := data["command"].(string)
+	text, _ := data["text"].(string)
+
+	if commandName != "/command-service" {
+		jsonReply(w, fmt.Sprintf("未知命令: %s", commandName))
+		return
+	}
+
+	text = strings.TrimSpace(text)
+	if text == "" {
+		text = "hp"
+	}
+
+	result, err := executeCommandServiceCommand(rctx(), text)
+	if err != nil {
+		slog.Error("command service command failed", "command", text, "err", err, "trace_id", event.TraceID)
+		jsonReply(w, fmt.Sprintf("命令服务执行失败: %v", err))
+		return
+	}
+
+	jsonReply(w, renderReply(result))
+}
+
+func executeCommandServiceCommand(ctx context.Context, command string) (*CommandResult, error) {
+	payload, _ := json.Marshal(map[string]string{"command": command})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.CommandAPIBaseURL+"/command", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var result CommandResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func renderReply(result *CommandResult) string {
+	if result == nil {
+		return "命令服务返回为空"
+	}
+	content := strings.TrimSpace(result.Content)
+	if content == "" {
+		return "命令服务返回为空"
+	}
+
+	switch result.Type {
+	case "image":
+		if strings.HasPrefix(content, "http://") || strings.HasPrefix(content, "https://") {
+			return content
+		}
+		if strings.HasPrefix(content, "data:image/") {
+			return "命令返回了一张图片，但当前 App 同步回复只稳定支持文本，御坂如实地报告道。"
+		}
+		return "命令返回了图片内容，但当前 App 版本暂不直接回传该图片格式，御坂如实地报告道。"
+	default:
+		return content
+	}
+}
+
+func jsonReply(w http.ResponseWriter, text string) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"reply": text})
+}
+
+func getInstallation(id string) *Installation {
+	inst := &Installation{}
+	err := db.QueryRow("SELECT id, app_token, signing_secret, bot_id, handle FROM installations WHERE id=$1", id).
+		Scan(&inst.ID, &inst.AppToken, &inst.SigningSecret, &inst.BotID, &inst.Handle)
+	if err != nil {
+		return nil
+	}
+	return inst
+}
+
+func computeSignature(secret, timestamp string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(timestamp + ":"))
+	mac.Write(body)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envIntOr(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func rctx() context.Context {
+	return context.Background()
+}
