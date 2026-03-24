@@ -1,4 +1,4 @@
 .env
 *.log
 openilink-app-bh
-openilink-app-command-service-bridge
+openilink-app-command-service

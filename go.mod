@@ -1,4 +1,4 @@
-module github.com/openilink/openilink-app-command-service-bridge
+module github.com/openilink/openilink-app-command-service
 
 go 1.26.1
 

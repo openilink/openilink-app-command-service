@@ -145,8 +145,8 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 func handleManifest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"slug":        "command-service-bridge",
-		"name":        "Command Service Bridge",
+		"slug":        "command-service",
+		"name":        "Command Service",
 		"description": "Bridge to an HTTP command service, currently backed by bhwa233-api",
 		"icon":        "🛰️",
 		"commands": []map[string]string{

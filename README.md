@@ -1,4 +1,4 @@
-# openilink-app-command-service-bridge
+# openilink-app-command-service
 
 OpenILink Hub App for a command service bridge, currently backed by `bhwa233-api`.
 
@@ -23,8 +23,8 @@ The app serves its manifest at:
 
 Manifest values:
 
-- Slug: `command-service-bridge`
-- Name: `Command Service Bridge`
+- Slug: `command-service`
+- Name: `Command Service`
 - Command: `/command-service`
 
 ## Environment
