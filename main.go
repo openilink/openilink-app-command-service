@@ -141,20 +141,24 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		Handle         string `json:"handle"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		slog.Warn("callback: invalid json", "err", err)
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
+
+	slog.Info("callback received", "installation_id", req.InstallationID, "bot_id", req.BotID, "handle", req.Handle)
 
 	_, err := db.Exec(`INSERT INTO installations (id, app_token, signing_secret, bot_id, handle)
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (id) DO UPDATE SET app_token=$2, signing_secret=$3, bot_id=$4, handle=$5`,
 		req.InstallationID, req.AppToken, req.SigningSecret, req.BotID, req.Handle)
 	if err != nil {
-		slog.Error("save installation failed", "err", err)
+		slog.Error("save installation failed", "installation_id", req.InstallationID, "err", err)
 		http.Error(w, "save failed", http.StatusInternalServerError)
 		return
 	}
 
+	slog.Info("installation saved", "installation_id", req.InstallationID)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"request_url": cfg.BaseURL + "/hub/webhook"})
 }
@@ -174,7 +178,7 @@ func handleManifest(w http.ResponseWriter, r *http.Request) {
 		"icon":         "🛰️",
 		"tools":        buildManifestTools(defs),
 		"events":       []string{},
-		"scopes":       []string{},
+		"scopes":       []string{"messages.send"},
 		"redirect_url": cfg.BaseURL + "/callback",
 	})
 }
@@ -257,6 +261,7 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 
 	var event HubEvent
 	if err := json.Unmarshal(body, &event); err != nil {
+		slog.Warn("webhook: invalid json", "err", err)
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
@@ -266,6 +271,7 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 			Challenge string `json:"challenge"`
 		}
 		_ = json.Unmarshal(body, &challenge)
+		slog.Info("url verification", "challenge", challenge.Challenge)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"challenge": challenge.Challenge})
 		return
@@ -273,6 +279,7 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 
 	inst := getInstallation(event.InstallationID)
 	if inst == nil {
+		slog.Warn("unknown installation", "installation_id", event.InstallationID, "trace_id", event.TraceID)
 		http.Error(w, "unknown installation", http.StatusUnauthorized)
 		return
 	}
@@ -281,6 +288,7 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 	signature := r.Header.Get("X-Signature")
 	expected := computeSignature(inst.SigningSecret, timestamp, body)
 	if signature != "sha256="+expected {
+		slog.Warn("invalid signature", "installation_id", inst.ID, "trace_id", event.TraceID)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
@@ -303,6 +311,7 @@ func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 
 	commandKey := strings.TrimSpace(strings.TrimPrefix(commandName, "/"))
 	if commandKey == "" {
+		slog.Warn("empty command received", "trace_id", event.TraceID)
 		writeSyncReply(w, Reply{Text: "命令不能为空"})
 		return
 	}
@@ -322,6 +331,8 @@ func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 		fullCommand += " " + text
 	}
 
+	slog.Info("executing command", "command", fullCommand, "trace_id", event.TraceID)
+
 	// Try sync first; if upstream is slow, reply immediately and finish async.
 	syncDeadline := time.Duration(cfg.SyncDeadlineMS) * time.Millisecond
 	ctx, cancel := context.WithTimeout(rctx(), syncDeadline)
@@ -331,7 +342,7 @@ func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 	if ctx.Err() == nil {
 		// Finished within sync deadline.
 		if err != nil {
-			slog.Error("command failed", "command", fullCommand, "err", err, "trace_id", event.TraceID)
+			slog.Error("sync command failed", "command", fullCommand, "err", err, "trace_id", event.TraceID)
 			writeSyncReply(w, Reply{Text: fmt.Sprintf("命令服务执行失败: %v", err)})
 			return
 		}
@@ -344,6 +355,10 @@ func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 	writeSyncReply(w, Reply{Text: fmt.Sprintf("/%s 处理中，稍后推送结果…", commandKey)})
 
 	replyTo := resolveReplyTo(data)
+	if replyTo == "" {
+		slog.Warn("async reply has no recipient, cannot push result", "command", fullCommand, "trace_id", event.TraceID)
+		return
+	}
 	go func() {
 		asyncResult, asyncErr := executeCommandServiceCommand(rctx(), fullCommand)
 		var reply Reply
@@ -407,9 +422,10 @@ func sendBotMessage(appToken, to string, reply Reply, traceID string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("bot api %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("bot api %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
+	slog.Info("bot message sent", "to", to, "type", msg["type"], "trace_id", traceID)
 	return nil
 }
 
@@ -486,6 +502,9 @@ func getInstallation(id string) *Installation {
 	err := db.QueryRow("SELECT id, app_token, signing_secret, bot_id, handle FROM installations WHERE id=$1", id).
 		Scan(&inst.ID, &inst.AppToken, &inst.SigningSecret, &inst.BotID, &inst.Handle)
 	if err != nil {
+		if err != sql.ErrNoRows {
+			slog.Error("db query installation failed", "installation_id", id, "err", err)
+		}
 		return nil
 	}
 	return inst
