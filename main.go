@@ -414,6 +414,9 @@ func sendBotMessage(appToken, to string, reply Reply, traceID string) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+appToken)
 	req.Header.Set("Content-Type", "application/json")
+	if traceID != "" {
+		req.Header.Set("X-Trace-Id", traceID)
+	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
