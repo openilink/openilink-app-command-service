@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -58,6 +59,12 @@ type CommandResult struct {
 	Type    string `json:"type"`
 }
 
+type CommandDefinition struct {
+	Key         string `json:"key"`
+	Description string `json:"description"`
+	Type        string `json:"type,omitempty"`
+}
+
 var (
 	cfg        Config
 	db         *sql.DB
@@ -96,7 +103,7 @@ func main() {
 	})
 
 	addr := ":" + cfg.Port
-	slog.Info("command service bridge app starting", "addr", addr, "hub", cfg.HubURL, "command_api", cfg.CommandAPIBaseURL)
+	slog.Info("command service app starting", "addr", addr, "hub", cfg.HubURL, "command_api", cfg.CommandAPIBaseURL)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		slog.Error("server failed", "err", err)
 		os.Exit(1)
@@ -143,19 +150,86 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleManifest(w http.ResponseWriter, r *http.Request) {
+	defs, err := fetchCommandDefinitions(r.Context())
+	if err != nil {
+		slog.Warn("fetch command definitions failed", "err", err)
+		defs = fallbackCommandDefinitions()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"slug":        "command-service",
 		"name":        "Command Service",
-		"description": "Bridge to an HTTP command service, currently backed by bhwa233-api",
+		"description": "Expose upstream command-service commands directly, currently backed by bhwa233-api",
 		"icon":        "🛰️",
-		"commands": []map[string]string{
-			{"name": "/command-service", "description": "Run a command service command", "usage": "/command-service hp"},
-		},
-		"events":       []string{},
-		"scopes":       []string{},
+		"commands":    buildManifestCommands(defs),
+		"events":      []string{},
+		"scopes":      []string{},
 		"redirect_url": cfg.BaseURL + "/callback",
 	})
+}
+
+func buildManifestCommands(defs []CommandDefinition) []map[string]string {
+	commands := make([]map[string]string, 0, len(defs))
+	seen := map[string]bool{}
+
+	for _, def := range defs {
+		key := strings.TrimSpace(def.Key)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		usage := "/" + key
+		if strings.HasSuffix(def.Key, " ") {
+			usage += " <args>"
+		}
+
+		desc := strings.TrimSpace(def.Description)
+		if desc == "" {
+			desc = "Run command: " + key
+		}
+
+		commands = append(commands, map[string]string{
+			"name":        "/" + key,
+			"description": desc,
+			"usage":       usage,
+		})
+	}
+
+	sort.Slice(commands, func(i, j int) bool {
+		return commands[i]["name"] < commands[j]["name"]
+	})
+	return commands
+}
+
+func fetchCommandDefinitions(ctx context.Context) ([]CommandDefinition, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.CommandAPIBaseURL+"/command/hp", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var defs []CommandDefinition
+	if err := json.Unmarshal(body, &defs); err != nil {
+		return nil, err
+	}
+	return defs, nil
+}
+
+func fallbackCommandDefinitions() []CommandDefinition {
+	return []CommandDefinition{{Key: "hp", Description: "hp - 获取命令帮助"}}
 }
 
 func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
@@ -207,19 +281,21 @@ func handleCommand(w http.ResponseWriter, event HubEvent) {
 	commandName, _ := data["command"].(string)
 	text, _ := data["text"].(string)
 
-	if commandName != "/command-service" {
-		jsonReply(w, fmt.Sprintf("未知命令: %s", commandName))
+	commandKey := strings.TrimSpace(strings.TrimPrefix(commandName, "/"))
+	if commandKey == "" {
+		jsonReply(w, "命令不能为空")
 		return
 	}
 
 	text = strings.TrimSpace(text)
-	if text == "" {
-		text = "hp"
+	fullCommand := commandKey
+	if text != "" {
+		fullCommand += " " + text
 	}
 
-	result, err := executeCommandServiceCommand(rctx(), text)
+	result, err := executeCommandServiceCommand(rctx(), fullCommand)
 	if err != nil {
-		slog.Error("command service command failed", "command", text, "err", err, "trace_id", event.TraceID)
+		slog.Error("command service command failed", "command", fullCommand, "err", err, "trace_id", event.TraceID)
 		jsonReply(w, fmt.Sprintf("命令服务执行失败: %v", err))
 		return
 	}

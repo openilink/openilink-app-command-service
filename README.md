@@ -1,13 +1,21 @@
 # openilink-app-command-service
 
-OpenILink Hub App for a command service bridge, currently backed by `bhwa233-api`.
+OpenILink Hub App for a command service, currently backed by `bhwa233-api`.
 
 ## What it does
 
-- Exposes a `/command-service` command in OpenILink Hub
-- Forwards `/command-service <text>` to `POST /command` on `bhwa233-api`
-- Returns text results directly in the synchronous App reply
-- Defaults to `hp` when called as `/command-service` with no arguments
+- Dynamically fetches the upstream command list from `GET /command/hp`
+- Registers those commands directly in the App manifest
+- Forwards `/<command> <text>` to `POST /command` on `bhwa233-api`
+- Avoids the old two-layer command style like `/command-service hp`
+
+Examples:
+
+- `/hp`
+- `/wb`
+- `/gold`
+- `/a 你好鸡哥`
+- `/gi 夜晚城市霓虹街道`
 
 ## Current behavior
 
@@ -25,7 +33,7 @@ Manifest values:
 
 - Slug: `command-service`
 - Name: `Command Service`
-- Command: `/command-service`
+- Commands: dynamically generated from upstream `/command/hp`
 
 ## Environment
 
