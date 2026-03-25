@@ -343,7 +343,7 @@ func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 		// Finished within sync deadline.
 		if err != nil {
 			slog.Error("sync command failed", "command", fullCommand, "err", err, "trace_id", event.TraceID)
-			writeSyncReply(w, Reply{Text: fmt.Sprintf("命令服务执行失败: %v", err)})
+			writeSyncReply(w, Reply{Text: friendlyError(err)})
 			return
 		}
 		writeSyncReply(w, resolveReply(result))
@@ -364,7 +364,7 @@ func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 		var reply Reply
 		if asyncErr != nil {
 			slog.Error("async command failed", "command", fullCommand, "err", asyncErr, "trace_id", event.TraceID)
-			reply = Reply{Text: fmt.Sprintf("命令服务执行失败: %v", asyncErr)}
+			reply = Reply{Text: friendlyError(asyncErr)}
 		} else {
 			reply = resolveReply(asyncResult)
 		}
@@ -430,6 +430,23 @@ func sendBotMessage(appToken, to string, reply Reply, traceID string) error {
 	}
 	slog.Info("bot message sent", "to", to, "type", msg["type"], "trace_id", traceID)
 	return nil
+}
+
+func friendlyError(err error) string {
+	if err == nil {
+		return "未知错误"
+	}
+	s := err.Error()
+	if strings.Contains(s, "context deadline exceeded") || strings.Contains(s, "Client.Timeout") {
+		return "命令服务响应超时，请稍后重试"
+	}
+	if strings.Contains(s, "no such host") || strings.Contains(s, "dial tcp") {
+		return "无法连接命令服务，请检查网络后重试"
+	}
+	if strings.Contains(s, "upstream 5") {
+		return "命令服务内部错误，请稍后重试"
+	}
+	return fmt.Sprintf("命令执行出错: %v", err)
 }
 
 func executeCommandServiceCommand(ctx context.Context, command string) (*CommandResult, error) {
