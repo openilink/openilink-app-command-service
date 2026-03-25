@@ -87,7 +87,7 @@ func main() {
 		DatabaseURL:         os.Getenv("DATABASE_URL"),
 		BaseURL:             strings.TrimRight(os.Getenv("BASE_URL"), "/"),
 		CommandAPIBaseURL:   strings.TrimRight(envOr("COMMAND_API_BASE_URL", "https://bhwa233-api.vercel.app/api"), "/"),
-		CommandAPITimeoutMS: envIntOr("COMMAND_API_TIMEOUT_MS", 10000),
+		CommandAPITimeoutMS: envIntOr("COMMAND_API_TIMEOUT_MS", 60000),
 		SyncDeadlineMS:      envIntOr("SYNC_DEADLINE_MS", 2000),
 	}
 
