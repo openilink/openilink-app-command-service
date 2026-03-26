@@ -3,15 +3,16 @@ package main
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	sqlmock "github.com/DATA-DOG/go-sqlmock"
 )
 
 func setupMockCommandAPI(t *testing.T) *httptest.Server {
@@ -36,18 +37,32 @@ func setupMockCommandAPI(t *testing.T) *httptest.Server {
 	return httptest.NewServer(mux)
 }
 
-func setupMockDB(t *testing.T) (sqlmock.Sqlmock, func()) {
+func setupTestDB(t *testing.T) func() {
 	t.Helper()
-	mockDB, mock, err := sqlmock.New()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	var err error
+	db, err = sql.Open("sqlite3", dbPath+"?_journal_mode=WAL")
 	if err != nil {
-		t.Fatalf("sqlmock.New: %v", err)
+		t.Fatalf("open sqlite: %v", err)
 	}
-	db = mockDB
-	cleanup := func() {
-		_ = mockDB.Close()
+	if err := migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	return func() {
+		db.Close()
+		os.Remove(dbPath)
 		db = nil
 	}
-	return mock, cleanup
+}
+
+func seedInstallation(t *testing.T, id, appToken, webhookSecret, botID string) {
+	t.Helper()
+	_, err := db.Exec("INSERT INTO installations (id, app_token, webhook_secret, bot_id) VALUES (?, ?, ?, ?)",
+		id, appToken, webhookSecret, botID)
+	if err != nil {
+		t.Fatalf("seed installation: %v", err)
+	}
 }
 
 func signBody(secret, ts string, body []byte) string {
@@ -60,17 +75,13 @@ func signBody(secret, ts string, body []byte) string {
 func TestMockHubWebhookGoldCommand(t *testing.T) {
 	ts := setupMockCommandAPI(t)
 	defer ts.Close()
-	mock, cleanup := setupMockDB(t)
+	cleanup := setupTestDB(t)
 	defer cleanup()
+	seedInstallation(t, "inst_1", "app_xxx", "secret123", "bot_1")
 
 	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000, SyncDeadlineMS: 2000}
-	httpClient = &http.Client{Timeout: 2 * time.Second}
-
-	rows := sqlmock.NewRows([]string{"id", "app_token", "webhook_secret", "bot_id"}).
-		AddRow("inst_1", "app_xxx", "secret123", "bot_1")
-	mock.ExpectQuery("SELECT id, app_token, webhook_secret, bot_id FROM installations WHERE id=\\$1").
-		WithArgs("inst_1").
-		WillReturnRows(rows)
+	commandClient = &http.Client{Timeout: 2 * time.Second}
+	botClient = &http.Client{Timeout: 2 * time.Second}
 
 	envelope := HubEvent{V: 1, Type: "event", TraceID: "tr_test", InstallationID: "inst_1"}
 	envelope.Event.Type = "command"
@@ -95,25 +106,18 @@ func TestMockHubWebhookGoldCommand(t *testing.T) {
 	if resp["reply"] != "黄金：1001 元/克" {
 		t.Fatalf("reply=%q", resp["reply"])
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("sql expectations: %v", err)
-	}
 }
 
 func TestMockHubWebhookCommandWithArgs(t *testing.T) {
 	ts := setupMockCommandAPI(t)
 	defer ts.Close()
-	mock, cleanup := setupMockDB(t)
+	cleanup := setupTestDB(t)
 	defer cleanup()
+	seedInstallation(t, "inst_1", "app_xxx", "secret123", "bot_1")
 
 	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000, SyncDeadlineMS: 2000}
-	httpClient = &http.Client{Timeout: 2 * time.Second}
-
-	rows := sqlmock.NewRows([]string{"id", "app_token", "webhook_secret", "bot_id"}).
-		AddRow("inst_1", "app_xxx", "secret123", "bot_1")
-	mock.ExpectQuery("SELECT id, app_token, webhook_secret, bot_id FROM installations WHERE id=\\$1").
-		WithArgs("inst_1").
-		WillReturnRows(rows)
+	commandClient = &http.Client{Timeout: 2 * time.Second}
+	botClient = &http.Client{Timeout: 2 * time.Second}
 
 	envelope := HubEvent{V: 1, Type: "event", TraceID: "tr_test_2", InstallationID: "inst_1"}
 	envelope.Event.Type = "command"
@@ -138,25 +142,18 @@ func TestMockHubWebhookCommandWithArgs(t *testing.T) {
 	if resp["reply"] != "鸡哥说：你好" {
 		t.Fatalf("reply=%q", resp["reply"])
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("sql expectations: %v", err)
-	}
 }
 
 func TestMockHubWebhookCommandWithStructuredArgs(t *testing.T) {
 	ts := setupMockCommandAPI(t)
 	defer ts.Close()
-	mock, cleanup := setupMockDB(t)
+	cleanup := setupTestDB(t)
 	defer cleanup()
+	seedInstallation(t, "inst_1", "app_xxx", "secret123", "bot_1")
 
 	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000, SyncDeadlineMS: 2000}
-	httpClient = &http.Client{Timeout: 2 * time.Second}
-
-	rows := sqlmock.NewRows([]string{"id", "app_token", "webhook_secret", "bot_id"}).
-		AddRow("inst_1", "app_xxx", "secret123", "bot_1")
-	mock.ExpectQuery("SELECT id, app_token, webhook_secret, bot_id FROM installations WHERE id=\\$1").
-		WithArgs("inst_1").
-		WillReturnRows(rows)
+	commandClient = &http.Client{Timeout: 2 * time.Second}
+	botClient = &http.Client{Timeout: 2 * time.Second}
 
 	envelope := HubEvent{V: 1, Type: "event", TraceID: "tr_test_3", InstallationID: "inst_1"}
 	envelope.Event.Type = "command"
@@ -185,9 +182,6 @@ func TestMockHubWebhookCommandWithStructuredArgs(t *testing.T) {
 	if resp["reply"] != "鸡哥说：你好" {
 		t.Fatalf("reply=%q", resp["reply"])
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("sql expectations: %v", err)
-	}
 }
 
 func TestMockImageReplyWithName(t *testing.T) {
@@ -195,7 +189,7 @@ func TestMockImageReplyWithName(t *testing.T) {
 	defer ts.Close()
 
 	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000, SyncDeadlineMS: 2000}
-	httpClient = &http.Client{Timeout: 2 * time.Second}
+	commandClient = &http.Client{Timeout: 2 * time.Second}
 
 	result, err := executeCommandServiceCommand(rctx(), "img")
 	if err != nil {
@@ -209,7 +203,6 @@ func TestMockImageReplyWithName(t *testing.T) {
 		t.Fatalf("expected MediaName=random.png, got %q", reply.MediaName)
 	}
 
-	// Verify sync reply includes reply_name.
 	w := httptest.NewRecorder()
 	writeSyncReply(w, reply)
 	var resp map[string]string
@@ -280,5 +273,22 @@ func TestURLVerification(t *testing.T) {
 	}
 	if resp["challenge"] != "test_challenge_123" {
 		t.Fatalf("challenge=%q", resp["challenge"])
+	}
+}
+
+func TestMigrationIdempotent(t *testing.T) {
+	cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Running migrate again should not fail.
+	if err := migrate(); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+
+	// Verify table works.
+	seedInstallation(t, "test_1", "tok", "sec", "bot")
+	inst := getInstallation("test_1")
+	if inst == nil || inst.AppToken != "tok" {
+		t.Fatalf("expected installation, got %+v", inst)
 	}
 }

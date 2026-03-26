@@ -7,10 +7,12 @@ services:
       PORT: "8081"
       HUB_URL: "https://hub.openilink.com"
       BASE_URL: "https://command-service-app.openilink.com"
-      DATABASE_URL: "postgres://openilink:${PG_PASS}@openilink-postgres:5432/openilink?sslmode=disable"
+      DB_PATH: "/data/command-service.db"
       APP_ID: "${APP_ID}"
       COMMAND_API_BASE_URL: "https://bhwa233-api.vercel.app/api"
       COMMAND_API_TIMEOUT_MS: "120000"
+    volumes:
+      - command-service-data:/data
     labels:
       - traefik.enable=true
       - "traefik.http.routers.command-service-app.rule=Host(`command-service-app.openilink.com`)"
@@ -19,6 +21,9 @@ services:
       - traefik.http.services.command-service-app.loadbalancer.server.port=8081
     networks:
       - traefik_default
+
+volumes:
+  command-service-data:
 
 networks:
   traefik_default:

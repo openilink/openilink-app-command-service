@@ -16,18 +16,19 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	_ "github.com/lib/pq"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type Config struct {
 	Port                string
 	HubURL              string
-	DatabaseURL         string
+	DBPath              string
 	BaseURL             string
 	AppID               string
 	CommandAPIBaseURL   string
@@ -79,9 +80,10 @@ type pkceEntry struct {
 }
 
 var (
-	cfg        Config
-	db         *sql.DB
-	httpClient *http.Client
+	cfg           Config
+	db            *sql.DB
+	commandClient *http.Client // upstream command API (long timeout)
+	botClient     *http.Client // Hub Bot API (short timeout)
 
 	pkceStates   = map[string]pkceEntry{}
 	pkceStatesMu sync.Mutex
@@ -91,7 +93,7 @@ func main() {
 	cfg = Config{
 		Port:                envOr("PORT", "8081"),
 		HubURL:              strings.TrimRight(envOr("HUB_URL", "https://hub.openilink.com"), "/"),
-		DatabaseURL:         os.Getenv("DATABASE_URL"),
+		DBPath:              envOr("DB_PATH", "/data/command-service.db"),
 		BaseURL:             strings.TrimRight(os.Getenv("BASE_URL"), "/"),
 		AppID:               os.Getenv("APP_ID"),
 		CommandAPIBaseURL:   strings.TrimRight(envOr("COMMAND_API_BASE_URL", "https://bhwa233-api.vercel.app/api"), "/"),
@@ -99,10 +101,16 @@ func main() {
 		SyncDeadlineMS:      envIntOr("SYNC_DEADLINE_MS", 2000),
 	}
 
-	httpClient = &http.Client{Timeout: time.Duration(cfg.CommandAPITimeoutMS) * time.Millisecond}
+	commandClient = &http.Client{Timeout: time.Duration(cfg.CommandAPITimeoutMS) * time.Millisecond}
+	botClient = &http.Client{Timeout: 15 * time.Second}
+
+	// Ensure DB directory exists.
+	if dir := filepath.Dir(cfg.DBPath); dir != "" {
+		_ = os.MkdirAll(dir, 0o755)
+	}
 
 	var err error
-	db, err = sql.Open("postgres", cfg.DatabaseURL)
+	db, err = sql.Open("sqlite3", cfg.DBPath+"?_journal_mode=WAL")
 	if err != nil {
 		slog.Error("db open failed", "err", err)
 		os.Exit(1)
@@ -121,22 +129,36 @@ func main() {
 	})
 
 	addr := ":" + cfg.Port
-	slog.Info("command service app starting", "addr", addr, "hub", cfg.HubURL, "command_api", cfg.CommandAPIBaseURL)
+	slog.Info("command service app starting", "addr", addr, "hub", cfg.HubURL, "db", cfg.DBPath, "command_api", cfg.CommandAPIBaseURL)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		slog.Error("server failed", "err", err)
 		os.Exit(1)
 	}
 }
 
+// --- Migration (version-based) ---
+
 func migrate() error {
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS installations (
-		id TEXT PRIMARY KEY,
-		app_token TEXT NOT NULL,
-		webhook_secret TEXT NOT NULL,
-		bot_id TEXT NOT NULL,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)`)
-	return err
+	var version int
+	_ = db.QueryRow("PRAGMA user_version").Scan(&version)
+
+	if version < 1 {
+		_, err := db.Exec(`CREATE TABLE IF NOT EXISTS installations (
+			id TEXT PRIMARY KEY,
+			app_token TEXT NOT NULL,
+			webhook_secret TEXT NOT NULL,
+			bot_id TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`)
+		if err != nil {
+			return err
+		}
+		if _, err := db.Exec("PRAGMA user_version = 1"); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // --- OAuth PKCE ---
@@ -154,7 +176,6 @@ func handleOAuthSetup(w http.ResponseWriter, r *http.Request) {
 	state := generateRandomString(32)
 
 	pkceStatesMu.Lock()
-	// Clean expired entries.
 	now := time.Now()
 	for k, v := range pkceStates {
 		if now.After(v.ExpiresAt) {
@@ -201,7 +222,14 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	})
 
 	exchangeURL := fmt.Sprintf("%s/api/apps/%s/oauth/exchange", cfg.HubURL, cfg.AppID)
-	resp, err := http.Post(exchangeURL, "application/json", bytes.NewReader(payload))
+	req, err := http.NewRequest(http.MethodPost, exchangeURL, bytes.NewReader(payload))
+	if err != nil {
+		slog.Error("oauth exchange build request failed", "err", err)
+		http.Error(w, "exchange request failed", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := botClient.Do(req)
 	if err != nil {
 		slog.Error("oauth exchange request failed", "err", err)
 		http.Error(w, "exchange request failed", http.StatusBadGateway)
@@ -229,8 +257,8 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, err = db.Exec(`INSERT INTO installations (id, app_token, webhook_secret, bot_id)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (id) DO UPDATE SET app_token=$2, webhook_secret=$3, bot_id=$4`,
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET app_token=excluded.app_token, webhook_secret=excluded.webhook_secret, bot_id=excluded.bot_id`,
 		result.InstallationID, result.AppToken, result.WebhookSecret, result.BotID)
 	if err != nil {
 		slog.Error("save installation failed", "installation_id", result.InstallationID, "err", err)
@@ -281,8 +309,8 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 
 	timestamp := r.Header.Get("X-Timestamp")
 	signature := r.Header.Get("X-Signature")
-	expected := computeSignature(inst.WebhookSecret, timestamp, body)
-	if signature != "sha256="+expected {
+	expected := "sha256=" + computeSignature(inst.WebhookSecret, timestamp, body)
+	if !hmac.Equal([]byte(signature), []byte(expected)) {
 		slog.Warn("invalid signature", "installation_id", inst.ID, "trace_id", event.TraceID)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
@@ -356,7 +384,10 @@ func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 		return
 	}
 	go func() {
-		asyncResult, asyncErr := executeCommandServiceCommand(rctx(), fullCommand)
+		asyncCtx, asyncCancel := context.WithTimeout(rctx(), time.Duration(cfg.CommandAPITimeoutMS)*time.Millisecond)
+		defer asyncCancel()
+
+		asyncResult, asyncErr := executeCommandServiceCommand(asyncCtx, fullCommand)
 		var reply Reply
 		if asyncErr != nil {
 			slog.Error("async command failed", "command", fullCommand, "err", asyncErr, "trace_id", event.TraceID)
@@ -422,7 +453,7 @@ func sendBotMessage(appToken, to string, reply Reply, traceID string) error {
 		req.Header.Set("X-Trace-Id", traceID)
 	}
 
-	resp, err := httpClient.Do(req)
+	resp, err := botClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -464,7 +495,7 @@ func executeCommandServiceCommand(ctx context.Context, command string) (*Command
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpClient.Do(req)
+	resp, err := commandClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -528,7 +559,7 @@ func writeSyncReply(w http.ResponseWriter, reply Reply) {
 
 func getInstallation(id string) *Installation {
 	inst := &Installation{}
-	err := db.QueryRow("SELECT id, app_token, webhook_secret, bot_id FROM installations WHERE id=$1", id).
+	err := db.QueryRow("SELECT id, app_token, webhook_secret, bot_id FROM installations WHERE id=?", id).
 		Scan(&inst.ID, &inst.AppToken, &inst.WebhookSecret, &inst.BotID)
 	if err != nil {
 		if err != sql.ErrNoRows {
