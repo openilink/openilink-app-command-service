@@ -214,14 +214,11 @@ func TestMockImageReplyWithName(t *testing.T) {
 	}
 }
 
-func TestOAuthSetupRedirect(t *testing.T) {
-	cfg = Config{
-		HubURL:  "https://hub.example.com",
-		AppID:   "app_123",
-		BaseURL: "https://myapp.example.com",
-	}
+func TestOAuthSetupRedirectWithHubParams(t *testing.T) {
+	// Hub passes hub, app_id, bot_id, state via query params.
+	cfg = Config{BaseURL: "https://myapp.example.com"}
 
-	req := httptest.NewRequest(http.MethodGet, "/oauth/setup?bot_id=bot_456", nil)
+	req := httptest.NewRequest(http.MethodGet, "/oauth/setup?hub=https://hub.example.com&app_id=app_123&bot_id=bot_456&state=hub_state_xyz", nil)
 	w := httptest.NewRecorder()
 
 	handleOAuthSetup(w, req)
@@ -239,8 +236,30 @@ func TestOAuthSetupRedirect(t *testing.T) {
 	if !strings.Contains(loc, "code_challenge=") {
 		t.Fatalf("missing code_challenge in redirect: %s", loc)
 	}
-	if !strings.Contains(loc, "state=") {
-		t.Fatalf("missing state in redirect: %s", loc)
+	if !strings.Contains(loc, "hub_state=hub_state_xyz") {
+		t.Fatalf("missing hub_state in redirect: %s", loc)
+	}
+}
+
+func TestOAuthSetupFallbackToConfig(t *testing.T) {
+	// No hub/app_id in query — falls back to config.
+	cfg = Config{
+		HubURL:  "https://hub.fallback.com",
+		AppID:   "app_fallback",
+		BaseURL: "https://myapp.example.com",
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth/setup?bot_id=bot_789", nil)
+	w := httptest.NewRecorder()
+
+	handleOAuthSetup(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d", w.Code)
+	}
+	loc := w.Header().Get("Location")
+	if !strings.HasPrefix(loc, "https://hub.fallback.com/api/apps/app_fallback/oauth/authorize?") {
+		t.Fatalf("unexpected redirect: %s", loc)
 	}
 }
 
@@ -252,8 +271,8 @@ func TestOAuthSetupMissingAppID(t *testing.T) {
 
 	handleOAuthSetup(w, req)
 
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500, got %d", w.Code)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
 	}
 }
 

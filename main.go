@@ -76,6 +76,8 @@ type Reply struct {
 // PKCE state for in-flight OAuth flows.
 type pkceEntry struct {
 	CodeVerifier string
+	HubURL       string // Hub URL from the setup request
+	AppID        string // App ID from the setup request
 	ExpiresAt    time.Time
 }
 
@@ -164,16 +166,29 @@ func migrate() error {
 // --- OAuth PKCE ---
 
 func handleOAuthSetup(w http.ResponseWriter, r *http.Request) {
-	if cfg.AppID == "" {
-		http.Error(w, "APP_ID not configured", http.StatusInternalServerError)
+	q := r.URL.Query()
+
+	// Hub passes these params: ?hub={hub_url}&app_id={app_id}&bot_id={bot_id}&state={state}
+	hubURL := strings.TrimRight(q.Get("hub"), "/")
+	if hubURL == "" {
+		hubURL = cfg.HubURL
+	}
+	appID := q.Get("app_id")
+	if appID == "" {
+		appID = cfg.AppID
+	}
+	if appID == "" {
+		http.Error(w, "app_id not provided", http.StatusBadRequest)
 		return
 	}
+	botID := q.Get("bot_id")
+	hubState := q.Get("state") // state from Hub (passed through)
 
 	verifier := generateRandomString(64)
 	h := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(h[:])
 
-	state := generateRandomString(32)
+	localState := generateRandomString(32)
 
 	pkceStatesMu.Lock()
 	now := time.Now()
@@ -182,17 +197,23 @@ func handleOAuthSetup(w http.ResponseWriter, r *http.Request) {
 			delete(pkceStates, k)
 		}
 	}
-	pkceStates[state] = pkceEntry{CodeVerifier: verifier, ExpiresAt: now.Add(10 * time.Minute)}
+	pkceStates[localState] = pkceEntry{
+		CodeVerifier: verifier,
+		HubURL:       hubURL,
+		AppID:        appID,
+		ExpiresAt:    now.Add(10 * time.Minute),
+	}
 	pkceStatesMu.Unlock()
-
-	botID := r.URL.Query().Get("bot_id")
 
 	params := url.Values{}
 	params.Set("bot_id", botID)
-	params.Set("state", state)
+	params.Set("state", localState)
 	params.Set("code_challenge", challenge)
+	if hubState != "" {
+		params.Set("hub_state", hubState)
+	}
 
-	redirectURL := fmt.Sprintf("%s/api/apps/%s/oauth/authorize?%s", cfg.HubURL, cfg.AppID, params.Encode())
+	redirectURL := fmt.Sprintf("%s/api/apps/%s/oauth/authorize?%s", hubURL, appID, params.Encode())
 	http.Redirect(w, r, redirectURL, http.StatusFound)
 }
 
@@ -221,7 +242,15 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		"code_verifier": entry.CodeVerifier,
 	})
 
-	exchangeURL := fmt.Sprintf("%s/api/apps/%s/oauth/exchange", cfg.HubURL, cfg.AppID)
+	hubURL := entry.HubURL
+	if hubURL == "" {
+		hubURL = cfg.HubURL
+	}
+	appID := entry.AppID
+	if appID == "" {
+		appID = cfg.AppID
+	}
+	exchangeURL := fmt.Sprintf("%s/api/apps/%s/oauth/exchange", hubURL, appID)
 	req, err := http.NewRequest(http.MethodPost, exchangeURL, bytes.NewReader(payload))
 	if err != nil {
 		slog.Error("oauth exchange build request failed", "err", err)
@@ -523,14 +552,14 @@ func resolveReply(result *CommandResult) Reply {
 	}
 
 	switch result.Type {
-	case "image":
+	case "image", "video", "file":
 		if strings.HasPrefix(content, "http://") || strings.HasPrefix(content, "https://") {
-			return Reply{MsgType: "image", MediaURL: content, MediaName: result.Name}
+			return Reply{MsgType: result.Type, MediaURL: content, MediaName: result.Name}
 		}
-		if strings.HasPrefix(content, "data:image/") {
-			return Reply{MsgType: "image", MediaBase64: content, MediaName: result.Name}
+		if strings.HasPrefix(content, "data:") {
+			return Reply{MsgType: result.Type, MediaBase64: content, MediaName: result.Name}
 		}
-		return Reply{Text: "命令返回了图片内容，但格式无法识别，御坂如实地报告道。"}
+		return Reply{Text: fmt.Sprintf("命令返回了%s内容，但格式无法识别。", result.Type)}
 	default:
 		return Reply{Text: content}
 	}
