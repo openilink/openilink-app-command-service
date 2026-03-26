@@ -4,18 +4,21 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -26,6 +29,7 @@ type Config struct {
 	HubURL              string
 	DatabaseURL         string
 	BaseURL             string
+	AppID               string
 	CommandAPIBaseURL   string
 	CommandAPITimeoutMS int
 	SyncDeadlineMS      int
@@ -34,9 +38,8 @@ type Config struct {
 type Installation struct {
 	ID            string
 	AppToken      string
-	SigningSecret string
+	WebhookSecret string
 	BotID         string
-	Handle        string
 }
 
 type HubEvent struct {
@@ -58,26 +61,30 @@ type HubEvent struct {
 type CommandResult struct {
 	Content string `json:"content"`
 	Type    string `json:"type"`
+	Name    string `json:"name,omitempty"`
 }
 
-// Reply represents a resolved reply ready for sync or async delivery.
 type Reply struct {
-	Text        string // text content or fallback
-	MsgType     string // "text" or "image"
-	MediaURL    string // non-empty for image URL replies
-	MediaBase64 string // non-empty for base64 image replies
+	Text        string
+	MsgType     string
+	MediaURL    string
+	MediaBase64 string
+	MediaName   string
 }
 
-type CommandDefinition struct {
-	Key         string `json:"key"`
-	Description string `json:"description"`
-	Type        string `json:"type,omitempty"`
+// PKCE state for in-flight OAuth flows.
+type pkceEntry struct {
+	CodeVerifier string
+	ExpiresAt    time.Time
 }
 
 var (
 	cfg        Config
 	db         *sql.DB
 	httpClient *http.Client
+
+	pkceStates   = map[string]pkceEntry{}
+	pkceStatesMu sync.Mutex
 )
 
 func main() {
@@ -86,6 +93,7 @@ func main() {
 		HubURL:              strings.TrimRight(envOr("HUB_URL", "https://hub.openilink.com"), "/"),
 		DatabaseURL:         os.Getenv("DATABASE_URL"),
 		BaseURL:             strings.TrimRight(os.Getenv("BASE_URL"), "/"),
+		AppID:               os.Getenv("APP_ID"),
 		CommandAPIBaseURL:   strings.TrimRight(envOr("COMMAND_API_BASE_URL", "https://bhwa233-api.vercel.app/api"), "/"),
 		CommandAPITimeoutMS: envIntOr("COMMAND_API_TIMEOUT_MS", 120000),
 		SyncDeadlineMS:      envIntOr("SYNC_DEADLINE_MS", 2000),
@@ -106,8 +114,8 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /hub/webhook", handleHubWebhook)
-	mux.HandleFunc("POST /callback", handleCallback)
-	mux.HandleFunc("GET /manifest.json", handleManifest)
+	mux.HandleFunc("GET /oauth/setup", handleOAuthSetup)
+	mux.HandleFunc("GET /oauth/callback", handleOAuthCallback)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
@@ -124,137 +132,124 @@ func migrate() error {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS installations (
 		id TEXT PRIMARY KEY,
 		app_token TEXT NOT NULL,
-		signing_secret TEXT NOT NULL,
+		webhook_secret TEXT NOT NULL,
 		bot_id TEXT NOT NULL,
-		handle TEXT NOT NULL DEFAULT '',
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`)
 	return err
 }
 
-func handleCallback(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		InstallationID string `json:"installation_id"`
-		AppToken       string `json:"app_token"`
-		SigningSecret  string `json:"signing_secret"`
-		BotID          string `json:"bot_id"`
-		Handle         string `json:"handle"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		slog.Warn("callback: invalid json", "err", err)
-		http.Error(w, "invalid json", http.StatusBadRequest)
+// --- OAuth PKCE ---
+
+func handleOAuthSetup(w http.ResponseWriter, r *http.Request) {
+	if cfg.AppID == "" {
+		http.Error(w, "APP_ID not configured", http.StatusInternalServerError)
 		return
 	}
 
-	slog.Info("callback received", "installation_id", req.InstallationID, "bot_id", req.BotID, "handle", req.Handle)
+	verifier := generateRandomString(64)
+	h := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(h[:])
 
-	_, err := db.Exec(`INSERT INTO installations (id, app_token, signing_secret, bot_id, handle)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (id) DO UPDATE SET app_token=$2, signing_secret=$3, bot_id=$4, handle=$5`,
-		req.InstallationID, req.AppToken, req.SigningSecret, req.BotID, req.Handle)
-	if err != nil {
-		slog.Error("save installation failed", "installation_id", req.InstallationID, "err", err)
-		http.Error(w, "save failed", http.StatusInternalServerError)
+	state := generateRandomString(32)
+
+	pkceStatesMu.Lock()
+	// Clean expired entries.
+	now := time.Now()
+	for k, v := range pkceStates {
+		if now.After(v.ExpiresAt) {
+			delete(pkceStates, k)
+		}
+	}
+	pkceStates[state] = pkceEntry{CodeVerifier: verifier, ExpiresAt: now.Add(10 * time.Minute)}
+	pkceStatesMu.Unlock()
+
+	botID := r.URL.Query().Get("bot_id")
+
+	params := url.Values{}
+	params.Set("bot_id", botID)
+	params.Set("state", state)
+	params.Set("code_challenge", challenge)
+
+	redirectURL := fmt.Sprintf("%s/api/apps/%s/oauth/authorize?%s", cfg.HubURL, cfg.AppID, params.Encode())
+	http.Redirect(w, r, redirectURL, http.StatusFound)
+}
+
+func handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	state := r.URL.Query().Get("state")
+	if code == "" || state == "" {
+		http.Error(w, "missing code or state", http.StatusBadRequest)
 		return
 	}
 
-	slog.Info("installation saved", "installation_id", req.InstallationID)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"request_url": cfg.BaseURL + "/hub/webhook"})
-}
+	pkceStatesMu.Lock()
+	entry, ok := pkceStates[state]
+	if ok {
+		delete(pkceStates, state)
+	}
+	pkceStatesMu.Unlock()
 
-func handleManifest(w http.ResponseWriter, r *http.Request) {
-	defs, err := fetchCommandDefinitions(r.Context())
-	if err != nil {
-		slog.Warn("fetch command definitions failed", "err", err)
-		defs = fallbackCommandDefinitions()
+	if !ok || time.Now().After(entry.ExpiresAt) {
+		http.Error(w, "invalid or expired state", http.StatusBadRequest)
+		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"slug":         "command-service",
-		"name":         "Command Service",
-		"description":  "Expose upstream command-service commands directly, currently backed by bhwa233-api",
-		"icon":         "🛰️",
-		"tools":        buildManifestTools(defs),
-		"events":       []string{},
-		"scopes":       []string{"messages.send"},
-		"redirect_url": cfg.BaseURL + "/callback",
+	payload, _ := json.Marshal(map[string]string{
+		"code":          code,
+		"code_verifier": entry.CodeVerifier,
 	})
-}
 
-func buildManifestTools(defs []CommandDefinition) []map[string]any {
-	tools := make([]map[string]any, 0, len(defs))
-	seen := map[string]bool{}
-
-	for _, def := range defs {
-		key := strings.TrimSpace(def.Key)
-		if key == "" || seen[key] {
-			continue
-		}
-		seen[key] = true
-
-		desc := strings.TrimSpace(def.Description)
-		if desc == "" {
-			desc = "Run command: " + key
-		}
-
-		tool := map[string]any{
-			"name":        key,
-			"description": desc,
-			"command":     key,
-		}
-
-		if strings.HasSuffix(def.Key, " ") {
-			tool["parameters"] = map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"text": map[string]any{
-						"type":        "string",
-						"description": "Command arguments",
-					},
-				},
-				"required": []string{"text"},
-			}
-		}
-
-		tools = append(tools, tool)
-	}
-
-	sort.Slice(tools, func(i, j int) bool {
-		return tools[i]["name"].(string) < tools[j]["name"].(string)
-	})
-	return tools
-}
-
-func fetchCommandDefinitions(ctx context.Context) ([]CommandDefinition, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.CommandAPIBaseURL+"/command/hp", nil)
+	exchangeURL := fmt.Sprintf("%s/api/apps/%s/oauth/exchange", cfg.HubURL, cfg.AppID)
+	resp, err := http.Post(exchangeURL, "application/json", bytes.NewReader(payload))
 	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
+		slog.Error("oauth exchange request failed", "err", err)
+		http.Error(w, "exchange request failed", http.StatusBadGateway)
+		return
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		slog.Error("oauth exchange failed", "status", resp.StatusCode, "body", string(body))
+		http.Error(w, "exchange failed: "+string(body), resp.StatusCode)
+		return
 	}
 
-	var defs []CommandDefinition
-	if err := json.Unmarshal(body, &defs); err != nil {
-		return nil, err
+	var result struct {
+		InstallationID string `json:"installation_id"`
+		AppToken       string `json:"app_token"`
+		WebhookSecret  string `json:"webhook_secret"`
+		BotID          string `json:"bot_id"`
 	}
-	return defs, nil
+	if err := json.Unmarshal(body, &result); err != nil {
+		slog.Error("oauth exchange decode failed", "err", err)
+		http.Error(w, "decode failed", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = db.Exec(`INSERT INTO installations (id, app_token, webhook_secret, bot_id)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (id) DO UPDATE SET app_token=$2, webhook_secret=$3, bot_id=$4`,
+		result.InstallationID, result.AppToken, result.WebhookSecret, result.BotID)
+	if err != nil {
+		slog.Error("save installation failed", "installation_id", result.InstallationID, "err", err)
+		http.Error(w, "save failed", http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("installation saved via oauth", "installation_id", result.InstallationID, "bot_id", result.BotID)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"ok": "true", "installation_id": result.InstallationID})
 }
 
-func fallbackCommandDefinitions() []CommandDefinition {
-	return []CommandDefinition{{Key: "hp", Description: "hp - 获取命令帮助"}}
+func generateRandomString(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)[:n]
 }
+
+// --- Webhook ---
 
 func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
@@ -286,7 +281,7 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 
 	timestamp := r.Header.Get("X-Timestamp")
 	signature := r.Header.Get("X-Signature")
-	expected := computeSignature(inst.SigningSecret, timestamp, body)
+	expected := computeSignature(inst.WebhookSecret, timestamp, body)
 	if signature != "sha256="+expected {
 		slog.Warn("invalid signature", "installation_id", inst.ID, "trace_id", event.TraceID)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
@@ -304,6 +299,8 @@ func handleHubWebhook(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
+// --- Command handling ---
+
 func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 	data := event.Event.Data
 	commandName, _ := data["command"].(string)
@@ -316,7 +313,7 @@ func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 		return
 	}
 
-	// Prefer structured args from AI Agent, fall back to free-form text from user.
+	// Prefer structured args from AI Agent, fall back to free-form text.
 	if argsRaw, ok := data["args"]; ok && argsRaw != nil {
 		if argsMap, ok := argsRaw.(map[string]any); ok {
 			if t, ok := argsMap["text"].(string); ok && t != "" {
@@ -340,7 +337,6 @@ func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 
 	result, err := executeCommandServiceCommand(ctx, fullCommand)
 	if ctx.Err() == nil {
-		// Finished within sync deadline.
 		if err != nil {
 			slog.Error("sync command failed", "command", fullCommand, "err", err, "trace_id", event.TraceID)
 			writeSyncReply(w, Reply{Text: friendlyError(err)})
@@ -388,6 +384,8 @@ func resolveReplyTo(data map[string]any) string {
 	return ""
 }
 
+// --- Bot API ---
+
 func sendBotMessage(appToken, to string, reply Reply, traceID string) error {
 	msg := map[string]string{
 		"to":       to,
@@ -399,16 +397,22 @@ func sendBotMessage(appToken, to string, reply Reply, traceID string) error {
 		if reply.Text != "" {
 			msg["content"] = reply.Text
 		}
+		if reply.MediaName != "" {
+			msg["filename"] = reply.MediaName
+		}
 	} else if reply.MediaBase64 != "" {
 		msg["type"] = reply.MsgType
 		msg["base64"] = reply.MediaBase64
+		if reply.MediaName != "" {
+			msg["filename"] = reply.MediaName
+		}
 	} else {
 		msg["type"] = "text"
 		msg["content"] = reply.Text
 	}
 
 	payload, _ := json.Marshal(msg)
-	req, err := http.NewRequestWithContext(rctx(), http.MethodPost, cfg.HubURL+"/bot/v1/messages/send", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(rctx(), http.MethodPost, cfg.HubURL+"/bot/v1/message/send", bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -431,6 +435,8 @@ func sendBotMessage(appToken, to string, reply Reply, traceID string) error {
 	slog.Info("bot message sent", "to", to, "type", msg["type"], "trace_id", traceID)
 	return nil
 }
+
+// --- Upstream command API ---
 
 func friendlyError(err error) string {
 	if err == nil {
@@ -488,10 +494,10 @@ func resolveReply(result *CommandResult) Reply {
 	switch result.Type {
 	case "image":
 		if strings.HasPrefix(content, "http://") || strings.HasPrefix(content, "https://") {
-			return Reply{MsgType: "image", MediaURL: content}
+			return Reply{MsgType: "image", MediaURL: content, MediaName: result.Name}
 		}
 		if strings.HasPrefix(content, "data:image/") {
-			return Reply{MsgType: "image", MediaBase64: content}
+			return Reply{MsgType: "image", MediaBase64: content, MediaName: result.Name}
 		}
 		return Reply{Text: "命令返回了图片内容，但格式无法识别，御坂如实地报告道。"}
 	default:
@@ -509,16 +515,21 @@ func writeSyncReply(w http.ResponseWriter, reply Reply) {
 		resp["reply_type"] = reply.MsgType
 		resp["reply_base64"] = reply.MediaBase64
 	}
+	if reply.MediaName != "" {
+		resp["reply_name"] = reply.MediaName
+	}
 	if reply.Text != "" {
 		resp["reply"] = reply.Text
 	}
 	json.NewEncoder(w).Encode(resp)
 }
 
+// --- DB helpers ---
+
 func getInstallation(id string) *Installation {
 	inst := &Installation{}
-	err := db.QueryRow("SELECT id, app_token, signing_secret, bot_id, handle FROM installations WHERE id=$1", id).
-		Scan(&inst.ID, &inst.AppToken, &inst.SigningSecret, &inst.BotID, &inst.Handle)
+	err := db.QueryRow("SELECT id, app_token, webhook_secret, bot_id FROM installations WHERE id=$1", id).
+		Scan(&inst.ID, &inst.AppToken, &inst.WebhookSecret, &inst.BotID)
 	if err != nil {
 		if err != sql.ErrNoRows {
 			slog.Error("db query installation failed", "installation_id", id, "err", err)
@@ -534,6 +545,8 @@ func computeSignature(secret, timestamp string, body []byte) string {
 	mac.Write(body)
 	return hex.EncodeToString(mac.Sum(nil))
 }
+
+// --- Utilities ---
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {

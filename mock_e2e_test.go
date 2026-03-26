@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -17,16 +16,7 @@ import (
 
 func setupMockCommandAPI(t *testing.T) *httptest.Server {
 	t.Helper()
-	fixture, err := os.ReadFile("e2e/fixtures/commands_hp.json")
-	if err != nil {
-		t.Fatalf("read fixture: %v", err)
-	}
-
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/command/hp", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(fixture)
-	})
 	mux.HandleFunc("/api/command", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Command string `json:"command"`
@@ -38,7 +28,7 @@ func setupMockCommandAPI(t *testing.T) *httptest.Server {
 		case "a 你好":
 			_ = json.NewEncoder(w).Encode(CommandResult{Content: "鸡哥说：你好", Type: "text"})
 		case "img":
-			_ = json.NewEncoder(w).Encode(CommandResult{Content: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", Type: "image"})
+			_ = json.NewEncoder(w).Encode(CommandResult{Content: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", Type: "image", Name: "random.png"})
 		default:
 			http.Error(w, `{"error":"unexpected command"}`, http.StatusBadRequest)
 		}
@@ -67,43 +57,6 @@ func signBody(secret, ts string, body []byte) string {
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
-func TestMockManifestDirectCommands(t *testing.T) {
-	ts := setupMockCommandAPI(t)
-	defer ts.Close()
-
-	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000, SyncDeadlineMS: 2000}
-	httpClient = &http.Client{Timeout: 2 * time.Second}
-
-	req := httptest.NewRequest(http.MethodGet, "/manifest.json", nil)
-	w := httptest.NewRecorder()
-	handleManifest(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
-	}
-
-	var body map[string]any
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("manifest decode: %v", err)
-	}
-
-	tools := body["tools"].([]any)
-	seenGold := false
-	seenA := false
-	for _, item := range tools {
-		m := item.(map[string]any)
-		if m["name"] == "gold" && m["command"] == "gold" {
-			seenGold = true
-		}
-		if m["name"] == "a" && m["command"] == "a" && m["parameters"] != nil {
-			seenA = true
-		}
-	}
-	if !seenGold || !seenA {
-		t.Fatalf("expected tool registration, got %s", w.Body.String())
-	}
-}
-
 func TestMockHubWebhookGoldCommand(t *testing.T) {
 	ts := setupMockCommandAPI(t)
 	defer ts.Close()
@@ -113,9 +66,9 @@ func TestMockHubWebhookGoldCommand(t *testing.T) {
 	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000, SyncDeadlineMS: 2000}
 	httpClient = &http.Client{Timeout: 2 * time.Second}
 
-	rows := sqlmock.NewRows([]string{"id", "app_token", "signing_secret", "bot_id", "handle"}).
-		AddRow("inst_1", "app_xxx", "secret123", "bot_1", "")
-	mock.ExpectQuery("SELECT id, app_token, signing_secret, bot_id, handle FROM installations WHERE id=\\$1").
+	rows := sqlmock.NewRows([]string{"id", "app_token", "webhook_secret", "bot_id"}).
+		AddRow("inst_1", "app_xxx", "secret123", "bot_1")
+	mock.ExpectQuery("SELECT id, app_token, webhook_secret, bot_id FROM installations WHERE id=\\$1").
 		WithArgs("inst_1").
 		WillReturnRows(rows)
 
@@ -156,9 +109,9 @@ func TestMockHubWebhookCommandWithArgs(t *testing.T) {
 	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000, SyncDeadlineMS: 2000}
 	httpClient = &http.Client{Timeout: 2 * time.Second}
 
-	rows := sqlmock.NewRows([]string{"id", "app_token", "signing_secret", "bot_id", "handle"}).
-		AddRow("inst_1", "app_xxx", "secret123", "bot_1", "")
-	mock.ExpectQuery("SELECT id, app_token, signing_secret, bot_id, handle FROM installations WHERE id=\\$1").
+	rows := sqlmock.NewRows([]string{"id", "app_token", "webhook_secret", "bot_id"}).
+		AddRow("inst_1", "app_xxx", "secret123", "bot_1")
+	mock.ExpectQuery("SELECT id, app_token, webhook_secret, bot_id FROM installations WHERE id=\\$1").
 		WithArgs("inst_1").
 		WillReturnRows(rows)
 
@@ -199,13 +152,12 @@ func TestMockHubWebhookCommandWithStructuredArgs(t *testing.T) {
 	cfg = Config{CommandAPIBaseURL: ts.URL + "/api", CommandAPITimeoutMS: 2000, SyncDeadlineMS: 2000}
 	httpClient = &http.Client{Timeout: 2 * time.Second}
 
-	rows := sqlmock.NewRows([]string{"id", "app_token", "signing_secret", "bot_id", "handle"}).
-		AddRow("inst_1", "app_xxx", "secret123", "bot_1", "")
-	mock.ExpectQuery("SELECT id, app_token, signing_secret, bot_id, handle FROM installations WHERE id=\\$1").
+	rows := sqlmock.NewRows([]string{"id", "app_token", "webhook_secret", "bot_id"}).
+		AddRow("inst_1", "app_xxx", "secret123", "bot_1")
+	mock.ExpectQuery("SELECT id, app_token, webhook_secret, bot_id FROM installations WHERE id=\\$1").
 		WithArgs("inst_1").
 		WillReturnRows(rows)
 
-	// AI Agent triggers with structured args
 	envelope := HubEvent{V: 1, Type: "event", TraceID: "tr_test_3", InstallationID: "inst_1"}
 	envelope.Event.Type = "command"
 	envelope.Event.Data = map[string]any{
@@ -238,7 +190,7 @@ func TestMockHubWebhookCommandWithStructuredArgs(t *testing.T) {
 	}
 }
 
-func TestMockImageResultFallsBackToTextNotice(t *testing.T) {
+func TestMockImageReplyWithName(t *testing.T) {
 	ts := setupMockCommandAPI(t)
 	defer ts.Close()
 
@@ -252,5 +204,81 @@ func TestMockImageResultFallsBackToTextNotice(t *testing.T) {
 	reply := resolveReply(result)
 	if reply.MsgType != "image" || reply.MediaBase64 == "" {
 		t.Fatalf("expected base64 image reply, got type=%q base64=%q text=%q", reply.MsgType, reply.MediaBase64, reply.Text)
+	}
+	if reply.MediaName != "random.png" {
+		t.Fatalf("expected MediaName=random.png, got %q", reply.MediaName)
+	}
+
+	// Verify sync reply includes reply_name.
+	w := httptest.NewRecorder()
+	writeSyncReply(w, reply)
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode sync reply: %v", err)
+	}
+	if resp["reply_name"] != "random.png" {
+		t.Fatalf("expected reply_name=random.png, got %q", resp["reply_name"])
+	}
+}
+
+func TestOAuthSetupRedirect(t *testing.T) {
+	cfg = Config{
+		HubURL:  "https://hub.example.com",
+		AppID:   "app_123",
+		BaseURL: "https://myapp.example.com",
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth/setup?bot_id=bot_456", nil)
+	w := httptest.NewRecorder()
+
+	handleOAuthSetup(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d", w.Code)
+	}
+	loc := w.Header().Get("Location")
+	if !strings.HasPrefix(loc, "https://hub.example.com/api/apps/app_123/oauth/authorize?") {
+		t.Fatalf("unexpected redirect: %s", loc)
+	}
+	if !strings.Contains(loc, "bot_id=bot_456") {
+		t.Fatalf("missing bot_id in redirect: %s", loc)
+	}
+	if !strings.Contains(loc, "code_challenge=") {
+		t.Fatalf("missing code_challenge in redirect: %s", loc)
+	}
+	if !strings.Contains(loc, "state=") {
+		t.Fatalf("missing state in redirect: %s", loc)
+	}
+}
+
+func TestOAuthSetupMissingAppID(t *testing.T) {
+	cfg = Config{AppID: ""}
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth/setup", nil)
+	w := httptest.NewRecorder()
+
+	handleOAuthSetup(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", w.Code)
+	}
+}
+
+func TestURLVerification(t *testing.T) {
+	body := `{"v":1,"type":"url_verification","challenge":"test_challenge_123"}`
+	req := httptest.NewRequest(http.MethodPost, "/hub/webhook", strings.NewReader(body))
+	w := httptest.NewRecorder()
+
+	handleHubWebhook(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["challenge"] != "test_challenge_123" {
+		t.Fatalf("challenge=%q", resp["challenge"])
 	}
 }
