@@ -296,8 +296,13 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("installation saved via oauth", "installation_id", result.InstallationID, "bot_id", result.BotID)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"ok": "true", "installation_id": result.InstallationID})
+
+	// Redirect to return_url to close the OAuth popup and return user to Hub.
+	returnURL := r.URL.Query().Get("return_url")
+	if returnURL == "" {
+		returnURL = hubURL + "/oauth/complete"
+	}
+	http.Redirect(w, r, returnURL, http.StatusFound)
 }
 
 func generateRandomString(n int) string {
