@@ -100,7 +100,7 @@ func main() {
 		AppID:               os.Getenv("APP_ID"),
 		CommandAPIBaseURL:   strings.TrimRight(envOr("COMMAND_API_BASE_URL", "https://bhwa233-api.vercel.app/api"), "/"),
 		CommandAPITimeoutMS: envIntOr("COMMAND_API_TIMEOUT_MS", 120000),
-		SyncDeadlineMS:      envIntOr("SYNC_DEADLINE_MS", 2000),
+		SyncDeadlineMS:      envIntOr("SYNC_DEADLINE_MS", 5000),
 	}
 
 	commandClient = &http.Client{Timeout: time.Duration(cfg.CommandAPITimeoutMS) * time.Millisecond}
