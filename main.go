@@ -542,7 +542,7 @@ func handleCommand(w http.ResponseWriter, event HubEvent, inst *Installation) {
 
 	// Sync deadline exceeded — ack now, finish in background.
 	slog.Info("command going async", "command", fullCommand, "trace_id", event.TraceID)
-	writeSyncReply(w, Reply{Text: fmt.Sprintf("/%s 处理中，稍后推送结果…", commandKey)})
+	writeAsyncReply(w)
 
 	replyTo := resolveReplyTo(data)
 	if replyTo == "" {
@@ -700,6 +700,11 @@ func resolveReply(result *CommandResult) Reply {
 	default:
 		return Reply{Text: content}
 	}
+}
+
+func writeAsyncReply(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"reply_async": true})
 }
 
 func writeSyncReply(w http.ResponseWriter, reply Reply) {
