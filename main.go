@@ -73,11 +73,17 @@ type Reply struct {
 	MediaName   string
 }
 
+type CommandDefinition struct {
+	Key         string `json:"key"`
+	Description string `json:"description"`
+}
+
 // PKCE state for in-flight OAuth flows.
 type pkceEntry struct {
 	CodeVerifier string
 	HubURL       string // Hub URL from the setup request
 	AppID        string // App ID from the setup request
+	ReturnURL    string // return_url to redirect after exchange
 	ExpiresAt    time.Time
 }
 
@@ -121,6 +127,9 @@ func main() {
 		slog.Error("db migrate failed", "err", err)
 		os.Exit(1)
 	}
+
+	// Sync tools to Hub using existing installation token (if any).
+	go syncToolsOnStartup()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /hub/webhook", handleHubWebhook)
@@ -182,7 +191,8 @@ func handleOAuthSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	botID := q.Get("bot_id")
-	hubState := q.Get("state") // state from Hub (passed through)
+	hubState := q.Get("state")     // state from Hub (passed through)
+	returnURL := q.Get("return_url") // return_url to redirect after exchange
 
 	verifier := generateRandomString(64)
 	h := sha256.Sum256([]byte(verifier))
@@ -201,6 +211,7 @@ func handleOAuthSetup(w http.ResponseWriter, r *http.Request) {
 		CodeVerifier: verifier,
 		HubURL:       hubURL,
 		AppID:        appID,
+		ReturnURL:    returnURL,
 		ExpiresAt:    now.Add(10 * time.Minute),
 	}
 	pkceStatesMu.Unlock()
@@ -297,8 +308,14 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("installation saved via oauth", "installation_id", result.InstallationID, "bot_id", result.BotID)
 
+	// Sync tools to Hub in background after new installation.
+	go syncToolsToHub(result.AppToken)
+
 	// Redirect to return_url to close the OAuth popup and return user to Hub.
-	returnURL := r.URL.Query().Get("return_url")
+	returnURL := entry.ReturnURL
+	if returnURL == "" {
+		returnURL = r.URL.Query().Get("return_url")
+	}
 	if returnURL == "" {
 		returnURL = hubURL + "/oauth/complete"
 	}
@@ -309,6 +326,121 @@ func generateRandomString(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return base64.RawURLEncoding.EncodeToString(b)[:n]
+}
+
+// --- Tool sync ---
+
+func fetchCommandDefinitions(ctx context.Context) ([]CommandDefinition, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.CommandAPIBaseURL+"/command/hp", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := commandClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var defs []CommandDefinition
+	if err := json.Unmarshal(body, &defs); err != nil {
+		return nil, err
+	}
+	return defs, nil
+}
+
+func buildHubTools(defs []CommandDefinition) []map[string]any {
+	tools := make([]map[string]any, 0, len(defs))
+	seen := map[string]bool{}
+
+	for _, def := range defs {
+		key := strings.TrimSpace(def.Key)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		desc := strings.TrimSpace(def.Description)
+		if desc == "" {
+			desc = "Run command: " + key
+		}
+
+		tool := map[string]any{
+			"name":        key,
+			"description": desc,
+			"command":     key,
+		}
+
+		// If the upstream key has a trailing space, it accepts arguments.
+		if strings.HasSuffix(def.Key, " ") {
+			tool["parameters"] = map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"text": map[string]any{
+						"type":        "string",
+						"description": "Command arguments",
+					},
+				},
+				"required": []string{"text"},
+			}
+		}
+
+		tools = append(tools, tool)
+	}
+	return tools
+}
+
+func syncToolsToHub(appToken string) {
+	ctx, cancel := context.WithTimeout(rctx(), 30*time.Second)
+	defer cancel()
+
+	defs, err := fetchCommandDefinitions(ctx)
+	if err != nil {
+		slog.Error("fetch command definitions failed", "err", err)
+		return
+	}
+
+	tools := buildHubTools(defs)
+	payload, _ := json.Marshal(map[string]any{"tools": tools})
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, cfg.HubURL+"/bot/v1/app/tools", bytes.NewReader(payload))
+	if err != nil {
+		slog.Error("build tool sync request failed", "err", err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+appToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := botClient.Do(req)
+	if err != nil {
+		slog.Error("tool sync request failed", "err", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		slog.Error("tool sync failed", "status", resp.StatusCode, "body", string(body))
+		return
+	}
+	slog.Info("tools synced to hub", "tool_count", len(tools))
+}
+
+// syncToolsOnStartup tries to sync tools using any existing installation's token.
+func syncToolsOnStartup() {
+	var appToken string
+	err := db.QueryRow("SELECT app_token FROM installations LIMIT 1").Scan(&appToken)
+	if err != nil {
+		slog.Info("no installations found, skipping tool sync on startup")
+		return
+	}
+	syncToolsToHub(appToken)
 }
 
 // --- Webhook ---
